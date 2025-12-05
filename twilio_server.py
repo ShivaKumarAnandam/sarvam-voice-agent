@@ -32,7 +32,7 @@ twilio_client = Client(
 @app.get("/")
 @app.head("/")
 async def root():
-    return {"status": "Twilio server running", "service": "Pipecat + Twilio"}
+    return {"status": "Twilio server running", "service": "Pipecat + Twilio", "version": "1.0.1"}
 
 
 @app.get("/health")
