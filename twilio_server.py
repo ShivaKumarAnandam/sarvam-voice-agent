@@ -612,4 +612,12 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     is_production = os.getenv("ENVIRONMENT", "development") == "production"
     logger.info(f"Starting Twilio server on port {port} ({'production' if is_production else 'development'} mode)")
-    uvicorn.run("twilio_server:app", host="0.0.0.0", port=port, reload=not is_production)
+    
+    # In production (Render), disable reload to prevent crashes
+    uvicorn.run(
+        "twilio_server:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,  # Always disable reload for stability
+        log_level="info"
+    )
