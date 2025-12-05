@@ -2,6 +2,15 @@
 .env
 .env.local
 
+# Documentation files (keep local only)
+*.md
+*.txt
+*.bat
+
+# But keep these essential files
+!requirements.txt
+!render.yaml
+
 # Python
 __pycache__/
 *.py[cod]
