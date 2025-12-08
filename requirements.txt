@@ -1,0 +1,34 @@
+# ===== Pipecat Framework =====
+pipecat-ai>=0.0.95
+
+# ===== Sarvam AI Integration =====
+sarvamai>=0.1.21
+
+# ===== LLM Service =====
+openai>=1.0.0
+
+# ===== Environment and Logging =====
+python-dotenv>=1.0.0
+loguru>=0.7.0
+
+# ===== Audio Processing =====
+numpy>=1.24.0
+
+# ===== AI Models =====
+transformers>=4.30.0
+torch>=2.0.0
+
+# ===== Web Framework (for WebRTC) =====
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# ===== WebRTC Transport =====
+aiortc>=1.5.0
+pipecat-ai-small-webrtc-prebuilt
+opencv-python>=4.8.0
+
+# Twilio SDK (for phone call integration)
+twilio>=8.10.0
+
+# HTTP Client (for Sarvam AI API calls)
+aiohttp>=3.9.0
