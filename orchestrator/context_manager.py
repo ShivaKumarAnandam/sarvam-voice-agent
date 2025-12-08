@@ -64,7 +64,7 @@ class ContextManager:
         Get current context for LLM
         
         Args:
-            system_prompt: Optional system prompt to include
+            system_prompt: Optional system prompt to include (only used if no system message exists)
             include_metadata: Whether to include user metadata
             
         Returns:
@@ -72,29 +72,39 @@ class ContextManager:
         """
         messages = []
         
-        # Add system prompt if provided
-        if system_prompt:
+        # Check if system message already exists in conversation history
+        system_messages = [msg for msg in self.conversation_history if msg.get("role") == "system"]
+        non_system_messages = [msg for msg in self.conversation_history if msg.get("role") != "system"]
+        
+        # Add system prompt - use existing one from history, or provided one, or skip
+        if system_messages:
+            # Use existing system message from history (should be first)
+            messages.append({
+                "role": "system",
+                "content": system_messages[0]["content"]
+            })
+        elif system_prompt:
+            # Use provided system prompt if no system message in history
             messages.append({
                 "role": "system",
                 "content": system_prompt
             })
         
-        # Add conversation history
+        # Add non-system conversation history
         # Convert to LLM format (remove timestamp and language from content)
-        for msg in self.conversation_history:
+        for msg in non_system_messages:
             llm_msg = {
                 "role": msg["role"],
                 "content": msg["content"]
             }
             messages.append(llm_msg)
         
-        # Add metadata if requested
+        # Add metadata if requested (but not as system message to avoid duplicates)
         if include_metadata and self.user_metadata:
-            metadata_msg = {
-                "role": "system",
-                "content": f"User metadata: {self.user_metadata}"
-            }
-            messages.insert(1, metadata_msg)  # Insert after system prompt
+            # Add metadata as a user message note instead
+            metadata_note = f"[User metadata: {self.user_metadata}]"
+            if messages and messages[-1].get("role") == "user":
+                messages[-1]["content"] = messages[-1]["content"] + " " + metadata_note
         
         return messages
     

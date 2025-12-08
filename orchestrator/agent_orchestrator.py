@@ -128,7 +128,9 @@ class AgentOrchestrator:
             logger.info("📚 Step 2: Preparing context...")
             self.processing_state = "processing"
             
-            context = self.context_manager.get_context(system_prompt=system_prompt)
+            # Only pass system_prompt if not already set via set_system_prompt()
+            # get_context() will use existing system message from history if available
+            context = self.context_manager.get_context(system_prompt=system_prompt if not self.context_manager.conversation_history else None)
             
             # Step 4: LLM - Generate response
             logger.info("🧠 Step 3: Generating response...")
