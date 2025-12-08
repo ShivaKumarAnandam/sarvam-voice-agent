@@ -1,96 +1,213 @@
-# Agent Orchestrator Module
+# Agent Orchestrator
+
+Central controller for managing STT, LLM, and TTS interactions in voice agent systems.
 
 ## Overview
 
-The Agent Orchestrator is a central controller that manages interactions between STT (Speech-to-Text), LLM (Language Model), and TTS (Text-to-Speech) modules. It coordinates task routing, context management, and multilingual workflows.
+The Agent Orchestrator provides a clean, modular architecture for coordinating speech-to-text, language model, and text-to-speech operations. It handles:
 
-## Structure
+- **Task Routing**: Routes audio/text between STT, LLM, and TTS modules
+- **Context Management**: Maintains conversation history with sliding window
+- **Language Coordination**: Handles multilingual workflows and auto-switching
+- **Error Handling**: Circuit breakers, retries, and graceful degradation
+- **Performance Metrics**: Tracks latency and success rates
+
+## Architecture
 
 ```
-orchestrator/
-├── __init__.py                 # Module exports
-├── agent_orchestrator.py       # Main orchestrator class
-├── context_manager.py          # Conversation context management
-├── language_coordinator.py     # Language coordination
-└── task_router.py              # Task routing between modules
+┌─────────────────────────────────────────────────────────┐
+│              Agent Orchestrator                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │ Task Router  │  │ Context      │  │ Language     │   │
+│  │              │  │ Manager      │  │ Coordinator  │   │
+│  └──────────────┘  └──────────────┘  └──────────────┘   │
+└─────────────────────────────────────────────────────────┘
+         │                    │                    │
+    ┌────▼────┐          ┌────▼────┐         ┌────▼────┐
+    │   STT   │          │   LLM   │         │   TTS   │
+    │ Module  │          │ Module  │         │ Module  │
+    └─────────┘          └─────────┘         └─────────┘
+```
+
+## Quick Start
+
+### Basic Usage
+
+```python
+from orchestrator import AgentOrchestrator
+from sarvam_ai import SarvamAI
+
+# Initialize modules
+sarvam = SarvamAI()
+
+# Create orchestrator
+orchestrator = AgentOrchestrator(
+    stt_module=sarvam,
+    llm_module=sarvam,
+    tts_module=sarvam,
+    default_language="te-IN"
+)
+
+# Process a conversation turn
+result = await orchestrator.process_turn(audio_wav_data)
+
+# Result contains:
+# - text: Transcribed text
+# - response: LLM response
+# - audio: TTS audio (WAV format)
+# - language: Language used
+# - metrics: Timing information
+```
+
+### With Metrics
+
+```python
+from orchestrator import AgentOrchestrator, MetricsCollector
+
+metrics = MetricsCollector()
+orchestrator = AgentOrchestrator(
+    stt_module=sarvam,
+    llm_module=sarvam,
+    tts_module=sarvam,
+    metrics_collector=metrics
+)
+
+# After processing turns
+averages = metrics.get_average_latencies()
+print(f"Average STT: {averages['stt']:.2f}s")
+print(f"Average LLM: {averages['llm']:.2f}s")
+print(f"Average TTS: {averages['tts']:.2f}s")
 ```
 
 ## Components
 
-### 1. AgentOrchestrator
-Main orchestrator class that coordinates all components.
+### AgentOrchestrator
 
-**Usage:**
-```python
-from orchestrator import AgentOrchestrator
+Main orchestrator class that coordinates all operations.
 
-# Initialize with STT, LLM, TTS modules
-orchestrator = AgentOrchestrator(sarvam, sarvam, sarvam, max_history=10)
+**Key Methods:**
+- `process_turn(audio_data, language, system_prompt)` - Process complete turn
+- `set_language(language_code)` - Set processing language
+- `set_system_prompt(prompt)` - Set system prompt
+- `get_status()` - Get current status
+- `clear_history()` - Clear conversation history
 
-# Set language
-orchestrator.set_language("te-IN")
+### TaskRouter
 
-# Set system prompt
-orchestrator.set_system_prompt("You are a helpful assistant...")
+Routes tasks between STT, LLM, and TTS modules with retry logic.
 
-# Process a conversation turn
-result = await orchestrator.process_turn(audio_data, language="te-IN")
+**Key Methods:**
+- `route_transcription(audio_data, language)` - Route to STT
+- `route_generation(text, context, language)` - Route to LLM
+- `route_synthesis(text, language)` - Route to TTS
+
+### ContextManager
+
+Manages conversation history and context.
+
+**Key Methods:**
+- `add_turn(user_input, assistant_response, language)` - Add turn
+- `get_context(system_prompt)` - Get formatted context
+- `clear_history()` - Clear history
+- `get_turn_count()` - Get number of turns
+
+### LanguageCoordinator
+
+Handles multilingual workflows and auto-switching.
+
+**Key Methods:**
+- `set_language(language_code)` - Set selected language
+- `set_detected_language(language_code)` - Set detected language
+- `ensure_consistency()` - Get processing language
+- `get_switch_status()` - Get switching status
+
+### MetricsCollector
+
+Tracks performance metrics.
+
+**Key Methods:**
+- `record_turn(stt_time, llm_time, tts_time, language)` - Record metrics
+- `get_average_latencies()` - Get averages
+- `get_language_statistics()` - Get per-language stats
+- `generate_report()` - Generate formatted report
+
+### CircuitBreaker
+
+Protects against cascading failures.
+
+**Key Methods:**
+- `call(func, *args, **kwargs)` - Call function with protection
+- `get_state()` - Get current state
+- `reset()` - Reset to closed state
+
+## Workflow
+
+The orchestrator follows this workflow:
+
+1. **STT**: Transcribe audio to text
+2. **Language Detection**: Detect/confirm language
+3. **Language Coordination**: Auto-switch if needed
+4. **Context Retrieval**: Get conversation history
+5. **LLM**: Generate response with context
+6. **Context Update**: Store turn in history
+7. **TTS**: Synthesize audio from response
+8. **Metrics**: Record timing information
+
+## Language Support
+
+Supported languages:
+- `te-IN` - Telugu
+- `hi-IN` - Hindi
+- `en-IN` - English
+- `gu-IN` - Gujarati
+
+### Auto-Switching
+
+The orchestrator can automatically switch languages if:
+- Different language is detected 2+ times consecutively
+- Minimum 1 turn has been processed
+
+## Error Handling
+
+### Retry Logic
+- STT: 2 retry attempts with 0.5s delay
+- TTS: 2 retry attempts with 0.5s delay
+- LLM: 2 retry attempts with 0.5s delay
+
+### Circuit Breaker
+- Opens after 5 consecutive failures
+- Closes after 60 seconds timeout
+- Half-open state for testing recovery
+
+### Graceful Degradation
+- If TTS fails, returns text response
+- If STT fails, returns error with context
+- If LLM fails, returns error with transcribed text
+
+## Testing
+
+Run tests:
+
+```bash
+# Unit tests
+pytest tests/unit/
+
+# Integration tests
+pytest tests/integration/
+
+# All tests
+pytest tests/
 ```
-
-### 2. ContextManager
-Manages conversation history with sliding window.
-
-**Features:**
-- Maintains conversation history
-- Sliding window to keep last N turns
-- Tracks language per turn
-- Stores user metadata
-
-### 3. LanguageCoordinator
-Ensures language consistency across STT → LLM → TTS.
-
-**Features:**
-- Tracks selected language (from IVR)
-- Tracks detected language (from STT)
-- Ensures consistency across pipeline
-- Language name mapping
-
-### 4. TaskRouter
-Routes tasks between modules with error handling.
-
-**Features:**
-- Routes transcription (STT)
-- Routes generation (LLM)
-- Routes synthesis (TTS)
-- Retry logic for failures
 
 ## Integration
 
-The orchestrator is integrated into `twilio_server.py` in the `media_stream()` function. It replaces the embedded orchestration logic while maintaining all existing functionality:
+See `examples/orchestrator_integration_example.py` for integration examples with Twilio WebSocket.
 
-- ✅ Voice Activity Detection (VAD)
-- ✅ Audio buffering
-- ✅ Transfer keyword detection
-- ✅ Error handling
-- ✅ Analytics tracking
+## Documentation
 
-## Benefits
+- [Complete Implementation Guide](../docs/AGENT_ORCHESTRATOR_COMPLETE_IMPLEMENTATION.md)
+- [Design Document](../docs/AGENT_ORCHESTRATOR_DESIGN.md)
 
-1. **Separation of Concerns**: Orchestration logic separated from business logic
-2. **Reusability**: Can be used across different projects
-3. **Testability**: Each component can be tested independently
-4. **Maintainability**: Easier to update and extend
-5. **Consistency**: Same orchestration pattern across all voice agents
+## License
 
-## Status
-
-✅ **Implemented and Integrated**
-- All components created
-- Integrated into twilio_server.py
-- Maintains backward compatibility
-- No breaking changes
-
----
-
-For detailed design, see `docs/AGENT_ORCHESTRATOR_DESIGN.md` and `docs/ORCHESTRATOR_IMPLEMENTATION_GUIDE.md`.
-
+Part of the Sarvam Voice Agent project.
