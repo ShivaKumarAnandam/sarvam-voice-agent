@@ -4,12 +4,14 @@ Combines patterns from Voice Agent, Indic, Sarvam, and AgentJyothi projects
 """
 
 import asyncio
+import time
 from typing import Optional, Dict, Any
 from loguru import logger
 
 from .context_manager import ContextManager
 from .language_coordinator import LanguageCoordinator
 from .task_router import TaskRouter
+from .metrics import MetricsCollector
 
 
 class AgentOrchestrator:
@@ -17,7 +19,14 @@ class AgentOrchestrator:
     Main orchestrator that coordinates STT, LLM, and TTS modules
     """
     
-    def __init__(self, stt_module, llm_module, tts_module, max_history: int = 10):
+    def __init__(
+        self,
+        stt_module,
+        llm_module,
+        tts_module,
+        max_history: int = 10,
+        metrics_collector: Optional[MetricsCollector] = None,
+    ):
         """
         Initialize agent orchestrator
         
@@ -26,6 +35,7 @@ class AgentOrchestrator:
             llm_module: LLM module instance (e.g., SarvamAI)
             tts_module: TTS module instance (e.g., SarvamAI)
             max_history: Maximum conversation history turns
+            metrics_collector: Optional metrics collector for latency tracking
         """
         # Store modules
         self.stt = stt_module
@@ -36,6 +46,7 @@ class AgentOrchestrator:
         self.context_manager = ContextManager(max_history=max_history)
         self.language_coordinator = LanguageCoordinator()
         self.task_router = TaskRouter(stt_module, llm_module, tts_module)
+        self.metrics = metrics_collector
         
         # State management
         self.is_processing = False
@@ -144,6 +155,7 @@ class AgentOrchestrator:
         self.processing_state = "processing"
         
         try:
+            stt_start = time.perf_counter()
             # Step 1: STT - Transcribe audio
             logger.info("📝 Step 1: Transcribing audio...")
             self.processing_state = "listening"
@@ -157,6 +169,7 @@ class AgentOrchestrator:
             if not text:
                 logger.warning("⚠️ STT failed, cannot continue")
                 return None
+            stt_time = time.perf_counter() - stt_start
             
             # Update detected language (this may trigger auto-switch)
             previous_language = self.language_coordinator.selected_language
@@ -177,6 +190,7 @@ class AgentOrchestrator:
             
             logger.info(f"🌐 Processing in: {self.language_coordinator.get_language_name(processing_language)}")
             
+            llm_start = time.perf_counter()
             # Step 3: Get context for LLM
             logger.info("📚 Step 2: Preparing context...")
             self.processing_state = "processing"
@@ -196,10 +210,12 @@ class AgentOrchestrator:
             if not response:
                 logger.warning("⚠️ LLM failed, cannot continue")
                 return None
+            llm_time = time.perf_counter() - llm_start
             
             # Step 5: Update context
             self.context_manager.add_turn(text, response, processing_language)
             
+            tts_start = time.perf_counter()
             # Step 6: TTS - Synthesize audio
             logger.info("🔊 Step 4: Synthesizing audio...")
             self.processing_state = "speaking"
@@ -218,6 +234,14 @@ class AgentOrchestrator:
                     "audio": None,
                     "language": processing_language
                 }
+            tts_time = time.perf_counter() - tts_start
+            
+            # Record metrics if collector provided
+            if self.metrics:
+                try:
+                    self.metrics.record_turn(stt_time, llm_time, tts_time, processing_language)
+                except Exception as metrics_error:
+                    logger.debug(f"⚠️ Metrics recording failed: {metrics_error}")
             
             # Success
             self.processing_state = "idle"
