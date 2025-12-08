@@ -16,6 +16,10 @@ load_dotenv()
 
 app = FastAPI()
 
+# Global dictionary to store language selection by call_sid
+# This is needed because Twilio Media Streams may not preserve query/path parameters
+call_language_map: dict[str, str] = {}
+
 # Validate required environment variables
 required_env_vars = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "SARVAM_API_KEY"]
 missing_vars = [var for var in required_env_vars if not os.getenv(var)]
@@ -174,6 +178,12 @@ async def language_selected(request: Request):
     selected_lang = language_map[digit]
     logger.info(f"🌐 User selected language: {selected_lang['name']} ({selected_lang['code']})")
     
+    # Get call_sid from form data to store language selection
+    call_sid = form_data.get("CallSid", "")
+    if call_sid:
+        call_language_map[call_sid] = selected_lang["code"]
+        logger.info(f"💾 Stored language {selected_lang['code']} for call {call_sid}")
+    
     # Create TwiML response
     response = VoiceResponse()
     
@@ -185,9 +195,10 @@ async def language_selected(request: Request):
     else:
         response.say("English. How may I assist you?", voice="Polly.Aditi", language="en-IN")
     
-    # Connect to WebSocket with language parameter
+    # Connect to WebSocket
+    # Language will be retrieved from call_language_map using call_sid from start event
     connect = Connect()
-    stream = Stream(url=f'wss://{request.url.hostname}/media-stream?lang={selected_lang["code"]}')
+    stream = Stream(url=f'wss://{request.url.hostname}/media-stream')
     connect.append(stream)
     response.append(connect)
     
@@ -199,10 +210,18 @@ async def media_stream(websocket: WebSocket):
     """Handle Twilio media stream WebSocket with full AI conversation"""
     await websocket.accept()
     
-    # Get selected language from query params
-    query_params = dict(websocket.query_params)
-    selected_language = query_params.get("lang", "te-IN")
-    logger.info(f"🔌 WebSocket connected with language: {selected_language}")
+    # Language will be determined from call_sid in the start event
+    # Default to Telugu until we get the call_sid
+    selected_language = "te-IN"
+    call_sid = None
+    
+    # Language name mapping
+    language_names = {
+        "te-IN": "Telugu",
+        "hi-IN": "Hindi", 
+        "en-IN": "English"
+    }
+    selected_lang_name = language_names.get(selected_language, "Telugu")
     
     from sarvam_ai import SarvamAI
     from audio_utils import decode_mulaw_base64, mulaw_to_wav, wav_to_mulaw, encode_mulaw_base64
@@ -242,15 +261,7 @@ async def media_stream(websocket: WebSocket):
     query_count = 0  # Track number of queries in this call
     last_user_query = None  # Remember last query for context
     
-    # Conversation context with language-specific system prompt
-    language_names = {
-        "te-IN": "Telugu",
-        "hi-IN": "Hindi", 
-        "en-IN": "English"
-    }
-    selected_lang_name = language_names.get(selected_language, "Telugu")
-    
-    # Set up orchestrator with language and system prompt
+    # Initialize orchestrator with default language (will be updated when we get call_sid)
     orchestrator.set_language(selected_language)
     system_prompt = f"""You are a helpful customer support agent for the Electrical Department in India.
 
@@ -483,8 +494,53 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
             
             if event_type == "start":
                 stream_sid = event["start"]["streamSid"]
+                call_sid = event["start"].get("callSid", "")
                 stream_ready = True
-                logger.info(f"🎙️ Stream started: {stream_sid}")
+                logger.info(f"🎙️ Stream started: {stream_sid}, CallSID: {call_sid}")
+                
+                # Retrieve language from stored map using call_sid
+                if call_sid and call_sid in call_language_map:
+                    selected_language = call_language_map[call_sid]
+                    selected_lang_name = language_names.get(selected_language, "Telugu")
+                    logger.info(f"🌐 Retrieved language from call_sid: {selected_lang_name} ({selected_language})")
+                    
+                    # Update orchestrator with correct language
+                    orchestrator.set_language(selected_language)
+                    system_prompt = f"""You are a helpful customer support agent for the Electrical Department in India.
+
+CRITICAL: User selected {selected_lang_name} language. You MUST respond ONLY in {selected_lang_name}.
+
+Your responsibilities:
+- Handle electrical complaints (power outages, voltage issues, meter problems)
+- Provide information about electricity bills and payments
+- Help with new connection requests
+- Report electrical hazards and emergencies
+- Provide lineman contact numbers and department information
+
+Guidelines:
+- Keep responses SHORT and CONCISE (2-3 sentences maximum for voice calls)
+- Be professional, polite, and helpful
+- Ask ONE clear question at a time
+- If you don't have specific information, acknowledge briefly and offer to connect to a human agent
+- For emergencies, prioritize safety and provide emergency contact: 1912
+
+Common queries you can help with:
+- Power outage complaints
+- High electricity bill queries
+- New connection applications
+- Meter reading issues
+- Lineman contact numbers
+- Payment methods
+- Emergency electrical issues
+
+Remember: ALWAYS respond in {selected_lang_name} language only!"""
+                    orchestrator.set_system_prompt(system_prompt)
+                    messages = orchestrator.get_context()
+                else:
+                    logger.warning(f"⚠️ No language found for call_sid {call_sid}, using default: Telugu (te-IN)")
+                    selected_language = "te-IN"
+                    selected_lang_name = "Telugu"
+                    orchestrator.set_language(selected_language)
             
             elif event_type == "media":
                 # Wait for stream to be ready before processing audio
@@ -542,6 +598,10 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
             
             elif event_type == "stop":
                 logger.info("🛑 Stream stopped")
+                # Clean up language mapping for this call
+                if call_sid and call_sid in call_language_map:
+                    del call_language_map[call_sid]
+                    logger.debug(f"🧹 Cleaned up language mapping for call {call_sid}")
                 break
     
     except asyncio.TimeoutError:
@@ -550,6 +610,11 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
         logger.error(f"❌ WebSocket error: {e}")
     
     finally:
+        # Clean up language mapping for this call (if not already cleaned)
+        if call_sid and call_sid in call_language_map:
+            del call_language_map[call_sid]
+            logger.debug(f"🧹 Cleaned up language mapping for call {call_sid}")
+        
         # Call analytics summary
         call_duration = asyncio.get_event_loop().time() - call_start_time
         logger.info(f"""

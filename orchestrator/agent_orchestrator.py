@@ -75,6 +75,48 @@ class AgentOrchestrator:
                 "content": system_prompt
             })
     
+    def _update_system_prompt_for_language(self, language_code: str):
+        """
+        Update system prompt to reflect current language
+        
+        Args:
+            language_code: New language code
+        """
+        lang_name = self.language_coordinator.get_language_name(language_code)
+        
+        # Find existing system prompt
+        system_msg = None
+        for msg in self.context_manager.conversation_history:
+            if msg.get("role") == "system":
+                system_msg = msg
+                break
+        
+        if system_msg:
+            # Update the system prompt with new language
+            content = system_msg["content"]
+            
+            # Replace language references in system prompt
+            # Pattern: "User selected {lang}" or "respond ONLY in {lang}"
+            import re
+            content = re.sub(
+                r"User selected \w+ language",
+                f"User selected {lang_name} language",
+                content
+            )
+            content = re.sub(
+                r"respond ONLY in \w+",
+                f"respond ONLY in {lang_name}",
+                content
+            )
+            content = re.sub(
+                r"ALWAYS respond in \w+ language only",
+                f"ALWAYS respond in {lang_name} language only",
+                content
+            )
+            
+            system_msg["content"] = content
+            logger.debug(f"📝 Updated system prompt for language: {lang_name}")
+    
     async def process_turn(
         self, 
         audio_data: bytes,
@@ -116,12 +158,23 @@ class AgentOrchestrator:
                 logger.warning("⚠️ STT failed, cannot continue")
                 return None
             
-            # Update detected language
+            # Update detected language (this may trigger auto-switch)
+            previous_language = self.language_coordinator.selected_language
             if detected_lang:
                 self.language_coordinator.set_detected_language(detected_lang)
             
             # Step 2: Language coordination
             processing_language = self.language_coordinator.ensure_consistency()
+            
+            # Check if language was auto-switched
+            if previous_language and previous_language != self.language_coordinator.selected_language:
+                logger.info(
+                    f"🔄 Language auto-switched: {self.language_coordinator.get_language_name(previous_language)} → "
+                    f"{self.language_coordinator.get_language_name(processing_language)}"
+                )
+                # Update system prompt to reflect new language
+                self._update_system_prompt_for_language(processing_language)
+            
             logger.info(f"🌐 Processing in: {self.language_coordinator.get_language_name(processing_language)}")
             
             # Step 3: Get context for LLM
@@ -200,12 +253,21 @@ class AgentOrchestrator:
         Returns:
             Dictionary with orchestrator status information
         """
+        switch_status = self.language_coordinator.get_switch_status()
         return {
             "is_processing": self.is_processing,
             "processing_state": self.processing_state,
             "current_language": self.language_coordinator.get_processing_language(),
             "language_name": self.language_coordinator.get_language_name(),
             "turn_count": self.context_manager.get_turn_count(),
-            "history_length": len(self.context_manager.conversation_history)
+            "history_length": len(self.context_manager.conversation_history),
+            "language_switching": {
+                "selected_language": switch_status["selected_language"],
+                "detected_language": switch_status["detected_language"],
+                "consecutive_different_count": switch_status["consecutive_different_count"],
+                "switch_threshold": switch_status["switch_threshold"],
+                "can_switch": switch_status["can_switch"],
+                "recent_history": switch_status["recent_history"]
+            }
         }
 
