@@ -206,11 +206,14 @@ async def media_stream(websocket: WebSocket):
     
     from sarvam_ai import SarvamAI
     from audio_utils import decode_mulaw_base64, mulaw_to_wav, wav_to_mulaw, encode_mulaw_base64
+    from orchestrator import AgentOrchestrator
     import json
     import audioop
     
     try:
         sarvam = SarvamAI()
+        # Initialize orchestrator with SarvamAI modules
+        orchestrator = AgentOrchestrator(sarvam, sarvam, sarvam, max_history=10)
     except ValueError as e:
         logger.error(f"❌ Failed to initialize Sarvam AI: {e}")
         await websocket.close(code=1011, reason="Configuration error")
@@ -247,10 +250,9 @@ async def media_stream(websocket: WebSocket):
     }
     selected_lang_name = language_names.get(selected_language, "Telugu")
     
-    messages = [
-        {
-            "role": "system",
-            "content": f"""You are a helpful customer support agent for the Electrical Department in India.
+    # Set up orchestrator with language and system prompt
+    orchestrator.set_language(selected_language)
+    system_prompt = f"""You are a helpful customer support agent for the Electrical Department in India.
 
 CRITICAL: User selected {selected_lang_name} language. You MUST respond ONLY in {selected_lang_name}.
 
@@ -278,11 +280,13 @@ Common queries you can help with:
 - Emergency electrical issues
 
 Remember: ALWAYS respond in {selected_lang_name} language only!"""
-        }
-    ]
+    orchestrator.set_system_prompt(system_prompt)
+    
+    # Keep messages for backward compatibility (used in transfer logic)
+    messages = orchestrator.get_context()
     
     async def process_speech_buffer():
-        """Process accumulated speech buffer"""
+        """Process accumulated speech buffer using orchestrator"""
         nonlocal is_speaking, is_processing, audio_buffer, silence_buffer, messages
         nonlocal failed_stt_count, query_count, last_user_query
         
@@ -319,39 +323,52 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
             is_processing = False  # Unlock on error
             return
         
-        # STT with user's selected language (force it, don't auto-detect)
         try:
             stt_start = asyncio.get_event_loop().time()
-            text, detected_lang = await sarvam.speech_to_text(wav_data, language=selected_language)
-            stt_duration = asyncio.get_event_loop().time() - stt_start
             
-            # Override detected language with selected language to maintain consistency
-            detected_lang = selected_language
+            # Use orchestrator to process the turn
+            result = await orchestrator.process_turn(
+                wav_data,
+                language=selected_language,
+                system_prompt=system_prompt
+            )
             
-            if not text or len(text.strip()) <= 2:
-                logger.warning(f"⚠️ No speech detected or transcript too short: '{text}'")
+            if not result:
+                logger.warning("⚠️ Orchestrator returned no result")
                 failed_stt_count += 1
                 
                 # Offer human transfer after multiple failures
                 if failed_stt_count >= max_failed_attempts:
-                    logger.warning(f"⚠️ {failed_stt_count} consecutive STT failures, offering human transfer")
+                    logger.warning(f"⚠️ {failed_stt_count} consecutive failures, offering human transfer")
                     fallback_msg = {
                         "te-IN": "క్షమించండి, నేను మీ మాటలు అర్థం చేసుకోలేకపోతున్నాను. మానవ ఏజెంట్‌కు కనెక్ట్ చేయాలా?",
                         "hi-IN": "क्षमा करें, मैं आपकी बात समझ नहीं पा रहा हूं। क्या मैं आपको किसी व्यक्ति से जोड़ूं?",
                         "en-IN": "Sorry, I'm having trouble understanding you. Would you like to speak with a human agent?"
                     }
-                    # Send fallback message (implementation would need TTS here)
                     logger.info(f"📞 Fallback: {fallback_msg.get(selected_language)}")
                 
-                is_processing = False  # Unlock
+                is_processing = False
                 return
             
-            # Reset failure count on successful STT
+            # Extract results from orchestrator
+            text = result.get("text")
+            response = result.get("response")
+            tts_wav = result.get("audio")
+            processing_lang = result.get("language", selected_language)
+            
+            if not text or len(text.strip()) <= 2:
+                logger.warning(f"⚠️ No speech detected or transcript too short: '{text}'")
+                failed_stt_count += 1
+                is_processing = False
+                return
+            
+            # Reset failure count on success
             failed_stt_count = 0
             query_count += 1
             last_user_query = text
             
-            logger.info(f"👤 User said ({detected_lang}): {text} [STT: {stt_duration:.2f}s, Query #{query_count}]")
+            stt_duration = asyncio.get_event_loop().time() - stt_start
+            logger.info(f"👤 User said ({processing_lang}): {text} [STT: {stt_duration:.2f}s, Query #{query_count}]")
             
             # Check for transfer keywords
             transfer_keywords = {
@@ -369,35 +386,26 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
                     "en-IN": "Connecting you to a human agent. Please wait."
                 }
                 response = transfer_msg.get(selected_language, transfer_msg["te-IN"])
-                messages.append({"role": "user", "content": text})
-                messages.append({"role": "assistant", "content": response})
+                # Update orchestrator context
+                orchestrator.context_manager.add_turn(text, response, selected_language)
+                # Update messages for backward compatibility
+                messages = orchestrator.get_context()
             else:
-                # Add conversation memory context
-                if query_count > 1 and last_user_query:
-                    context_note = f"\n[Previous query: {last_user_query}]"
-                    messages.append({"role": "user", "content": text + context_note})
-                else:
-                    messages.append({"role": "user", "content": text})
-                
-                # LLM
-                llm_start = asyncio.get_event_loop().time()
-                response = await sarvam.chat(messages)
-                llm_duration = asyncio.get_event_loop().time() - llm_start
-                logger.info(f"🤖 LLM response time: {llm_duration:.2f}s")
-                
-                messages.append({"role": "assistant", "content": response})
-            
-            # Keep conversation short
-            if len(messages) > 11:
-                messages = [messages[0]] + messages[-10:]
+                # Response already added to context by orchestrator
+                # Update messages for backward compatibility
+                messages = orchestrator.get_context()
             
             logger.info(f"🤖 AI responds: {response}")
             
-            # TTS in the user's SELECTED language (not detected)
-            tts_start = asyncio.get_event_loop().time()
-            tts_wav = await sarvam.text_to_speech(response, selected_language)
-            tts_duration = asyncio.get_event_loop().time() - tts_start
-            logger.info(f"🎵 TTS generation time: {tts_duration:.2f}s")
+            # Use TTS audio from orchestrator, or generate if not available
+            if not tts_wav:
+                logger.warning("⚠️ No TTS audio from orchestrator, generating...")
+                tts_start = asyncio.get_event_loop().time()
+                tts_wav = await sarvam.text_to_speech(response, selected_language)
+                tts_duration = asyncio.get_event_loop().time() - tts_start
+                logger.info(f"🎵 TTS generation time: {tts_duration:.2f}s")
+            else:
+                tts_duration = 0  # Already generated by orchestrator
             
             if tts_wav:
                 # Convert WAV to raw mulaw (8kHz, mono) for Twilio
@@ -450,7 +458,7 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
                     
                     send_duration = asyncio.get_event_loop().time() - send_start
                     total_time = asyncio.get_event_loop().time() - stt_start
-                    logger.info(f"⏱️ Total response time: {total_time:.2f}s (STT: {stt_duration:.2f}s, LLM: {llm_duration:.2f}s, TTS: {tts_duration:.2f}s, Send: {send_duration:.2f}s)")
+                    logger.info(f"⏱️ Total response time: {total_time:.2f}s (STT: {stt_duration:.2f}s, LLM: included, TTS: {tts_duration:.2f}s, Send: {send_duration:.2f}s)")
                     
                     is_processing = False  # Unlock after response sent
                 else:
