@@ -78,7 +78,7 @@ async def health_check():
 @app.post("/voice/incoming")
 @app.get("/voice/incoming")  # Also support GET
 async def incoming_call(request: Request):
-    """Handle incoming Twilio calls"""
+    """Handle incoming Twilio calls - directly connect to WebSocket with auto language detection"""
     logger.info(f"🔔 WEBHOOK HIT! Method: {request.method}, URL: {request.url}")
     
     # Handle both GET and POST
@@ -92,45 +92,19 @@ async def incoming_call(request: Request):
     
     logger.info(f"📞 Incoming call: {call_sid} from {from_number}")
     
-    # Create TwiML response with language selection
+    # Create TwiML response - directly connect to WebSocket (no language selection)
     response = VoiceResponse()
     
-    # Check if this is a retry (from query params)
-    retry = form_data.get("retry", "0")
+    # Multi-language greeting (will auto-detect language from first speech)
+    response.say("Welcome to Electrical Department Customer Support. Please speak your issue.", voice="Polly.Aditi", language="en-IN")
+    response.say("विद्युत विभाग ग्राहक सहायता में आपका स्वागत है। कृपया अपनी समस्या बताएं।", voice="Polly.Aditi", language="hi-IN")
+    response.say("విద్యుత్ శాఖ కస్టమర్ సపోర్ట్‌కు స్వాగతం. దయచేసి మీ సమస్యను చెప్పండి.", voice="Polly.Aditi", language="te-IN")
     
-    # Gather language selection (DTMF input)
-    gather = response.gather(
-        num_digits=1,
-        action=f'/voice/language-selected?retry={retry}',
-        method='POST',
-        timeout=10
-    )
-    
-    # Multi-language greeting
-    if retry == "0":
-        # First attempt - full greeting
-        gather.say("Welcome to Electrical Department Customer Support.", voice="Polly.Aditi", language="en-IN")
-        gather.pause(length=1)  # 1 second pause
-    else:
-        # Retry - shorter prompt
-        gather.say("Please select a language.", voice="Polly.Aditi", language="en-IN")
-        gather.say("దయచేసి భాషను ఎంచుకోండి.", voice="Polly.Aditi", language="te-IN")
-        gather.pause(length=1)  # 1 second pause
-    
-    # Language selection prompts
-    # Note: Using transliteration for Telugu as Polly.Aditi doesn't support Telugu script well
-    gather.say("Telugu kosam okati nokkandi.", voice="Polly.Aditi", language="en-IN")
-    gather.say("हिंदी के लिए 2 दबाएं.", voice="Polly.Aditi", language="hi-IN")
-    gather.say("Press 3 for English.", voice="Polly.Aditi", language="en-IN")
-    
-    # If no input after retry, default to Telugu
-    if retry == "1":
-        response.say("No input received.", voice="Polly.Aditi", language="en-IN")
-        response.say("తెలుగుకు మారుతోంది.", voice="Polly.Aditi", language="te-IN")
-        response.redirect('/voice/language-selected?Digits=1')
-    else:
-        # First timeout - ask again
-        response.redirect('/voice/incoming?retry=1')
+    # Connect directly to WebSocket (no language parameter - will auto-detect)
+    connect = Connect()
+    stream = Stream(url=f'wss://{request.url.hostname}/media-stream')
+    connect.append(stream)
+    response.append(connect)
     
     return Response(content=str(response), media_type="application/xml")
 
@@ -196,13 +170,12 @@ async def language_selected(request: Request):
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
-    """Handle Twilio media stream WebSocket with full AI conversation"""
+    """Handle Twilio media stream WebSocket with full AI conversation and auto language detection"""
     await websocket.accept()
     
-    # Get selected language from query params
-    query_params = dict(websocket.query_params)
-    selected_language = query_params.get("lang", "te-IN")
-    logger.info(f"🔌 WebSocket connected with language: {selected_language}")
+    # No language selection - will auto-detect from speech
+    detected_language = None  # Will be set after first STT
+    logger.info(f"🔌 WebSocket connected - language will be auto-detected from speech")
     
     from sarvam_ai import SarvamAI
     from audio_utils import decode_mulaw_base64, mulaw_to_wav, wav_to_mulaw, encode_mulaw_base64
@@ -239,20 +212,20 @@ async def media_stream(websocket: WebSocket):
     query_count = 0  # Track number of queries in this call
     last_user_query = None  # Remember last query for context
     
-    # Conversation context with language-specific system prompt
+    # Language mapping
     language_names = {
         "te-IN": "Telugu",
         "hi-IN": "Hindi", 
         "en-IN": "English"
     }
-    selected_lang_name = language_names.get(selected_language, "Telugu")
     
+    # Conversation context - will be updated dynamically based on detected language
     messages = [
         {
             "role": "system",
-            "content": f"""You are a helpful customer support agent for the Electrical Department in India.
+            "content": """You are a helpful customer support agent for the Electrical Department in India.
 
-CRITICAL: User selected {selected_lang_name} language. You MUST respond ONLY in {selected_lang_name}.
+IMPORTANT: Respond in the SAME language as the user speaks. If user speaks Telugu, respond in Telugu. If user speaks Hindi, respond in Hindi. If user speaks English, respond in English.
 
 Your responsibilities:
 - Handle electrical complaints (power outages, voltage issues, meter problems)
@@ -267,6 +240,7 @@ Guidelines:
 - Ask ONE clear question at a time
 - If you don't have specific information, acknowledge briefly and offer to connect to a human agent
 - For emergencies, prioritize safety and provide emergency contact: 1912
+- ALWAYS match the user's language - if they speak in Telugu/Hindi/English, respond in the same language
 
 Common queries you can help with:
 - Power outage complaints
@@ -275,16 +249,14 @@ Common queries you can help with:
 - Meter reading issues
 - Lineman contact numbers
 - Payment methods
-- Emergency electrical issues
-
-Remember: ALWAYS respond in {selected_lang_name} language only!"""
+- Emergency electrical issues"""
         }
     ]
     
     async def process_speech_buffer():
         """Process accumulated speech buffer"""
         nonlocal is_speaking, is_processing, audio_buffer, silence_buffer, messages
-        nonlocal failed_stt_count, query_count, last_user_query
+        nonlocal failed_stt_count, query_count, last_user_query, detected_language
         
         # Prevent concurrent processing
         if is_processing:
@@ -319,14 +291,23 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
             is_processing = False  # Unlock on error
             return
         
-        # STT with user's selected language (force it, don't auto-detect)
+        # STT with auto language detection (pass None to detect automatically)
         try:
             stt_start = asyncio.get_event_loop().time()
-            text, detected_lang = await sarvam.speech_to_text(wav_data, language=selected_language)
+            # Auto-detect language - pass None to try all languages
+            text, detected_lang = await sarvam.speech_to_text(wav_data, language=None)
             stt_duration = asyncio.get_event_loop().time() - stt_start
             
-            # Override detected language with selected language to maintain consistency
-            detected_lang = selected_language
+            # Update detected language (first detection sets it, subsequent detections can switch)
+            if detected_lang:
+                if detected_language is None:
+                    # First detection - set the language
+                    detected_language = detected_lang
+                    logger.info(f"🌐 Language auto-detected: {language_names.get(detected_language, detected_language)}")
+                elif detected_language != detected_lang:
+                    # Language switch detected
+                    logger.info(f"🔄 Language switched: {language_names.get(detected_language, detected_language)} → {language_names.get(detected_lang, detected_lang)}")
+                    detected_language = detected_lang
             
             if not text or len(text.strip()) <= 2:
                 logger.warning(f"⚠️ No speech detected or transcript too short: '{text}'")
@@ -335,13 +316,15 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
                 # Offer human transfer after multiple failures
                 if failed_stt_count >= max_failed_attempts:
                     logger.warning(f"⚠️ {failed_stt_count} consecutive STT failures, offering human transfer")
+                    # Use detected language if available, otherwise default to English
+                    current_lang = detected_language or "en-IN"
                     fallback_msg = {
                         "te-IN": "క్షమించండి, నేను మీ మాటలు అర్థం చేసుకోలేకపోతున్నాను. మానవ ఏజెంట్‌కు కనెక్ట్ చేయాలా?",
                         "hi-IN": "क्षमा करें, मैं आपकी बात समझ नहीं पा रहा हूं। क्या मैं आपको किसी व्यक्ति से जोड़ूं?",
                         "en-IN": "Sorry, I'm having trouble understanding you. Would you like to speak with a human agent?"
                     }
                     # Send fallback message (implementation would need TTS here)
-                    logger.info(f"📞 Fallback: {fallback_msg.get(selected_language)}")
+                    logger.info(f"📞 Fallback: {fallback_msg.get(current_lang, fallback_msg['en-IN'])}")
                 
                 is_processing = False  # Unlock
                 return
@@ -353,7 +336,8 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
             
             logger.info(f"👤 User said ({detected_lang}): {text} [STT: {stt_duration:.2f}s, Query #{query_count}]")
             
-            # Check for transfer keywords
+            # Check for transfer keywords (use detected language)
+            current_lang = detected_language or "en-IN"
             transfer_keywords = {
                 "te-IN": ["మానవుడు", "ఆపరేటర్", "వ్యక్తి", "ఎవరైనా"],
                 "hi-IN": ["मानव", "ऑपरेटर", "व्यक्ति", "कोई"],
@@ -361,14 +345,14 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
             }
             
             text_lower = text.lower()
-            if any(keyword in text_lower for keyword in transfer_keywords.get(selected_language, [])):
+            if any(keyword in text_lower for keyword in transfer_keywords.get(current_lang, transfer_keywords["en-IN"])):
                 logger.info(f"🔄 Transfer requested by user")
                 transfer_msg = {
                     "te-IN": "మానవ ఏజెంట్‌కు కనెక్ట్ చేస్తున్నాను. దయచేసి వేచి ఉండండి.",
                     "hi-IN": "मैं आपको किसी व्यक्ति से जोड़ रहा हूं। कृपया प्रतीक्षा करें।",
                     "en-IN": "Connecting you to a human agent. Please wait."
                 }
-                response = transfer_msg.get(selected_language, transfer_msg["te-IN"])
+                response = transfer_msg.get(current_lang, transfer_msg["en-IN"])
                 messages.append({"role": "user", "content": text})
                 messages.append({"role": "assistant", "content": response})
             else:
@@ -393,9 +377,10 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
             
             logger.info(f"🤖 AI responds: {response}")
             
-            # TTS in the user's SELECTED language (not detected)
+            # TTS in the DETECTED language (use detected language, fallback to English if not set)
+            current_lang = detected_language or "en-IN"
             tts_start = asyncio.get_event_loop().time()
-            tts_wav = await sarvam.text_to_speech(response, selected_language)
+            tts_wav = await sarvam.text_to_speech(response, current_lang)
             tts_duration = asyncio.get_event_loop().time() - tts_start
             logger.info(f"🎵 TTS generation time: {tts_duration:.2f}s")
             
@@ -544,10 +529,11 @@ Remember: ALWAYS respond in {selected_lang_name} language only!"""
     finally:
         # Call analytics summary
         call_duration = asyncio.get_event_loop().time() - call_start_time
+        final_language = detected_language or "auto-detected"
         logger.info(f"""
 📊 Call Summary:
    - Duration: {call_duration:.1f}s
-   - Language: {selected_language}
+   - Language: {final_language} ({language_names.get(final_language, 'unknown') if final_language != 'auto-detected' else 'not detected'})
    - Queries handled: {query_count}
    - Failed STT attempts: {failed_stt_count}
    - Stream ID: {stream_sid}
