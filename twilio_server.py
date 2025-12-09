@@ -16,6 +16,10 @@ load_dotenv()
 
 app = FastAPI()
 
+# Global dictionary to store language selection by call_sid
+# This is needed because Twilio Media Streams may not preserve query/path parameters
+call_language_map: dict[str, str] = {}
+
 # Validate required environment variables
 required_env_vars = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "SARVAM_API_KEY"]
 missing_vars = [var for var in required_env_vars if not os.getenv(var)]
@@ -78,7 +82,7 @@ async def health_check():
 @app.post("/voice/incoming")
 @app.get("/voice/incoming")  # Also support GET
 async def incoming_call(request: Request):
-    """Handle incoming Twilio calls - directly connect to WebSocket with auto language detection"""
+    """Handle incoming Twilio calls"""
     logger.info(f"🔔 WEBHOOK HIT! Method: {request.method}, URL: {request.url}")
     
     # Handle both GET and POST
@@ -92,19 +96,45 @@ async def incoming_call(request: Request):
     
     logger.info(f"📞 Incoming call: {call_sid} from {from_number}")
     
-    # Create TwiML response - directly connect to WebSocket (no language selection)
+    # Create TwiML response with language selection
     response = VoiceResponse()
     
-    # Multi-language greeting (will auto-detect language from first speech)
-    response.say("Welcome to Electrical Department Customer Support. Please speak your issue.", voice="Polly.Aditi", language="en-IN")
-    response.say("विद्युत विभाग ग्राहक सहायता में आपका स्वागत है। कृपया अपनी समस्या बताएं।", voice="Polly.Aditi", language="hi-IN")
-    response.say("విద్యుత్ శాఖ కస్టమర్ సపోర్ట్‌కు స్వాగతం. దయచేసి మీ సమస్యను చెప్పండి.", voice="Polly.Aditi", language="te-IN")
+    # Check if this is a retry (from query params)
+    retry = form_data.get("retry", "0")
     
-    # Connect directly to WebSocket (no language parameter - will auto-detect)
-    connect = Connect()
-    stream = Stream(url=f'wss://{request.url.hostname}/media-stream')
-    connect.append(stream)
-    response.append(connect)
+    # Gather language selection (DTMF input)
+    gather = response.gather(
+        num_digits=1,
+        action=f'/voice/language-selected?retry={retry}',
+        method='POST',
+        timeout=10
+    )
+    
+    # Multi-language greeting
+    if retry == "0":
+        # First attempt - full greeting
+        gather.say("Welcome to Electrical Department Customer Support.", voice="Polly.Aditi", language="en-IN")
+        gather.pause(length=1)  # 1 second pause
+    else:
+        # Retry - shorter prompt
+        gather.say("Please select a language.", voice="Polly.Aditi", language="en-IN")
+        gather.say("దయచేసి భాషను ఎంచుకోండి.", voice="Polly.Aditi", language="te-IN")
+        gather.pause(length=1)  # 1 second pause
+    
+    # Language selection prompts
+    # Note: Using transliteration for Telugu as Polly.Aditi doesn't support Telugu script well
+    gather.say("Telugu kosam okati nokkandi.", voice="Polly.Aditi", language="en-IN")
+    gather.say("हिंदी के लिए 2 दबाएं.", voice="Polly.Aditi", language="hi-IN")
+    gather.say("Press 3 for English.", voice="Polly.Aditi", language="en-IN")
+    
+    # If no input after retry, default to Telugu
+    if retry == "1":
+        response.say("No input received.", voice="Polly.Aditi", language="en-IN")
+        response.say("తెలుగుకు మారుతోంది.", voice="Polly.Aditi", language="te-IN")
+        response.redirect('/voice/language-selected?Digits=1')
+    else:
+        # First timeout - ask again
+        response.redirect('/voice/incoming?retry=1')
     
     return Response(content=str(response), media_type="application/xml")
 
@@ -148,6 +178,12 @@ async def language_selected(request: Request):
     selected_lang = language_map[digit]
     logger.info(f"🌐 User selected language: {selected_lang['name']} ({selected_lang['code']})")
     
+    # Get call_sid from form data to store language selection
+    call_sid = form_data.get("CallSid", "")
+    if call_sid:
+        call_language_map[call_sid] = selected_lang["code"]
+        logger.info(f"💾 Stored language {selected_lang['code']} for call {call_sid}")
+    
     # Create TwiML response
     response = VoiceResponse()
     
@@ -159,9 +195,10 @@ async def language_selected(request: Request):
     else:
         response.say("English. How may I assist you?", voice="Polly.Aditi", language="en-IN")
     
-    # Connect to WebSocket with language parameter
+    # Connect to WebSocket
+    # Language will be retrieved from call_language_map using call_sid from start event
     connect = Connect()
-    stream = Stream(url=f'wss://{request.url.hostname}/media-stream?lang={selected_lang["code"]}')
+    stream = Stream(url=f'wss://{request.url.hostname}/media-stream')
     connect.append(stream)
     response.append(connect)
     
@@ -170,20 +207,32 @@ async def language_selected(request: Request):
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
-    """Handle Twilio media stream WebSocket with full AI conversation and auto language detection"""
+    """Handle Twilio media stream WebSocket with full AI conversation"""
     await websocket.accept()
     
-    # No language selection - will auto-detect from speech
-    detected_language = None  # Will be set after first STT
-    logger.info(f"🔌 WebSocket connected - language will be auto-detected from speech")
+    # Language will be determined from call_sid in the start event
+    # Default to Telugu until we get the call_sid
+    selected_language = "te-IN"
+    call_sid = None
+    
+    # Language name mapping
+    language_names = {
+        "te-IN": "Telugu",
+        "hi-IN": "Hindi", 
+        "en-IN": "English"
+    }
+    selected_lang_name = language_names.get(selected_language, "Telugu")
     
     from sarvam_ai import SarvamAI
     from audio_utils import decode_mulaw_base64, mulaw_to_wav, wav_to_mulaw, encode_mulaw_base64
+    from orchestrator import AgentOrchestrator
     import json
     import audioop
     
     try:
         sarvam = SarvamAI()
+        # Initialize orchestrator with SarvamAI modules
+        orchestrator = AgentOrchestrator(sarvam, sarvam, sarvam, max_history=10)
     except ValueError as e:
         logger.error(f"❌ Failed to initialize Sarvam AI: {e}")
         await websocket.close(code=1011, reason="Configuration error")
@@ -212,20 +261,11 @@ async def media_stream(websocket: WebSocket):
     query_count = 0  # Track number of queries in this call
     last_user_query = None  # Remember last query for context
     
-    # Language mapping
-    language_names = {
-        "te-IN": "Telugu",
-        "hi-IN": "Hindi", 
-        "en-IN": "English"
-    }
-    
-    # Conversation context - will be updated dynamically based on detected language
-    messages = [
-        {
-            "role": "system",
-            "content": """You are a helpful customer support agent for the Electrical Department in India.
+    # Initialize orchestrator with default language (will be updated when we get call_sid)
+    orchestrator.set_language(selected_language)
+    system_prompt = f"""You are a helpful customer support agent for the Electrical Department in India.
 
-IMPORTANT: Respond in the SAME language as the user speaks. If user speaks Telugu, respond in Telugu. If user speaks Hindi, respond in Hindi. If user speaks English, respond in English.
+CRITICAL: User selected {selected_lang_name} language. You MUST respond ONLY in {selected_lang_name}.
 
 Your responsibilities:
 - Handle electrical complaints (power outages, voltage issues, meter problems)
@@ -240,7 +280,6 @@ Guidelines:
 - Ask ONE clear question at a time
 - If you don't have specific information, acknowledge briefly and offer to connect to a human agent
 - For emergencies, prioritize safety and provide emergency contact: 1912
-- ALWAYS match the user's language - if they speak in Telugu/Hindi/English, respond in the same language
 
 Common queries you can help with:
 - Power outage complaints
@@ -249,14 +288,18 @@ Common queries you can help with:
 - Meter reading issues
 - Lineman contact numbers
 - Payment methods
-- Emergency electrical issues"""
-        }
-    ]
+- Emergency electrical issues
+
+Remember: ALWAYS respond in {selected_lang_name} language only!"""
+    orchestrator.set_system_prompt(system_prompt)
+    
+    # Keep messages for backward compatibility (used in transfer logic)
+    messages = orchestrator.get_context()
     
     async def process_speech_buffer():
-        """Process accumulated speech buffer"""
+        """Process accumulated speech buffer using orchestrator"""
         nonlocal is_speaking, is_processing, audio_buffer, silence_buffer, messages
-        nonlocal failed_stt_count, query_count, last_user_query, detected_language
+        nonlocal failed_stt_count, query_count, last_user_query
         
         # Prevent concurrent processing
         if is_processing:
@@ -291,53 +334,54 @@ Common queries you can help with:
             is_processing = False  # Unlock on error
             return
         
-        # STT with auto language detection (pass None to detect automatically)
         try:
             stt_start = asyncio.get_event_loop().time()
-            # Auto-detect language - pass None to try all languages
-            text, detected_lang = await sarvam.speech_to_text(wav_data, language=None)
-            stt_duration = asyncio.get_event_loop().time() - stt_start
             
-            # Update detected language (first detection sets it, subsequent detections can switch)
-            if detected_lang:
-                if detected_language is None:
-                    # First detection - set the language
-                    detected_language = detected_lang
-                    logger.info(f"🌐 Language auto-detected: {language_names.get(detected_language, detected_language)}")
-                elif detected_language != detected_lang:
-                    # Language switch detected
-                    logger.info(f"🔄 Language switched: {language_names.get(detected_language, detected_language)} → {language_names.get(detected_lang, detected_lang)}")
-                    detected_language = detected_lang
+            # Use orchestrator to process the turn
+            result = await orchestrator.process_turn(
+                wav_data,
+                language=selected_language,
+                system_prompt=system_prompt
+            )
             
-            if not text or len(text.strip()) <= 2:
-                logger.warning(f"⚠️ No speech detected or transcript too short: '{text}'")
+            if not result:
+                logger.warning("⚠️ Orchestrator returned no result")
                 failed_stt_count += 1
                 
                 # Offer human transfer after multiple failures
                 if failed_stt_count >= max_failed_attempts:
-                    logger.warning(f"⚠️ {failed_stt_count} consecutive STT failures, offering human transfer")
-                    # Use detected language if available, otherwise default to English
-                    current_lang = detected_language or "en-IN"
+                    logger.warning(f"⚠️ {failed_stt_count} consecutive failures, offering human transfer")
                     fallback_msg = {
                         "te-IN": "క్షమించండి, నేను మీ మాటలు అర్థం చేసుకోలేకపోతున్నాను. మానవ ఏజెంట్‌కు కనెక్ట్ చేయాలా?",
                         "hi-IN": "क्षमा करें, मैं आपकी बात समझ नहीं पा रहा हूं। क्या मैं आपको किसी व्यक्ति से जोड़ूं?",
                         "en-IN": "Sorry, I'm having trouble understanding you. Would you like to speak with a human agent?"
                     }
-                    # Send fallback message (implementation would need TTS here)
-                    logger.info(f"📞 Fallback: {fallback_msg.get(current_lang, fallback_msg['en-IN'])}")
+                    logger.info(f"📞 Fallback: {fallback_msg.get(selected_language)}")
                 
-                is_processing = False  # Unlock
+                is_processing = False
                 return
             
-            # Reset failure count on successful STT
+            # Extract results from orchestrator
+            text = result.get("text")
+            response = result.get("response")
+            tts_wav = result.get("audio")
+            processing_lang = result.get("language", selected_language)
+            
+            if not text or len(text.strip()) <= 2:
+                logger.warning(f"⚠️ No speech detected or transcript too short: '{text}'")
+                failed_stt_count += 1
+                is_processing = False
+                return
+            
+            # Reset failure count on success
             failed_stt_count = 0
             query_count += 1
             last_user_query = text
             
-            logger.info(f"👤 User said ({detected_lang}): {text} [STT: {stt_duration:.2f}s, Query #{query_count}]")
+            stt_duration = asyncio.get_event_loop().time() - stt_start
+            logger.info(f"👤 User said ({processing_lang}): {text} [STT: {stt_duration:.2f}s, Query #{query_count}]")
             
-            # Check for transfer keywords (use detected language)
-            current_lang = detected_language or "en-IN"
+            # Check for transfer keywords
             transfer_keywords = {
                 "te-IN": ["మానవుడు", "ఆపరేటర్", "వ్యక్తి", "ఎవరైనా"],
                 "hi-IN": ["मानव", "ऑपरेटर", "व्यक्ति", "कोई"],
@@ -345,44 +389,34 @@ Common queries you can help with:
             }
             
             text_lower = text.lower()
-            if any(keyword in text_lower for keyword in transfer_keywords.get(current_lang, transfer_keywords["en-IN"])):
+            if any(keyword in text_lower for keyword in transfer_keywords.get(selected_language, [])):
                 logger.info(f"🔄 Transfer requested by user")
                 transfer_msg = {
                     "te-IN": "మానవ ఏజెంట్‌కు కనెక్ట్ చేస్తున్నాను. దయచేసి వేచి ఉండండి.",
                     "hi-IN": "मैं आपको किसी व्यक्ति से जोड़ रहा हूं। कृपया प्रतीक्षा करें।",
                     "en-IN": "Connecting you to a human agent. Please wait."
                 }
-                response = transfer_msg.get(current_lang, transfer_msg["en-IN"])
-                messages.append({"role": "user", "content": text})
-                messages.append({"role": "assistant", "content": response})
+                response = transfer_msg.get(selected_language, transfer_msg["te-IN"])
+                # Update orchestrator context
+                orchestrator.context_manager.add_turn(text, response, selected_language)
+                # Update messages for backward compatibility
+                messages = orchestrator.get_context()
             else:
-                # Add conversation memory context
-                if query_count > 1 and last_user_query:
-                    context_note = f"\n[Previous query: {last_user_query}]"
-                    messages.append({"role": "user", "content": text + context_note})
-                else:
-                    messages.append({"role": "user", "content": text})
-                
-                # LLM
-                llm_start = asyncio.get_event_loop().time()
-                response = await sarvam.chat(messages)
-                llm_duration = asyncio.get_event_loop().time() - llm_start
-                logger.info(f"🤖 LLM response time: {llm_duration:.2f}s")
-                
-                messages.append({"role": "assistant", "content": response})
-            
-            # Keep conversation short
-            if len(messages) > 11:
-                messages = [messages[0]] + messages[-10:]
+                # Response already added to context by orchestrator
+                # Update messages for backward compatibility
+                messages = orchestrator.get_context()
             
             logger.info(f"🤖 AI responds: {response}")
             
-            # TTS in the DETECTED language (use detected language, fallback to English if not set)
-            current_lang = detected_language or "en-IN"
-            tts_start = asyncio.get_event_loop().time()
-            tts_wav = await sarvam.text_to_speech(response, current_lang)
-            tts_duration = asyncio.get_event_loop().time() - tts_start
-            logger.info(f"🎵 TTS generation time: {tts_duration:.2f}s")
+            # Use TTS audio from orchestrator, or generate if not available
+            if not tts_wav:
+                logger.warning("⚠️ No TTS audio from orchestrator, generating...")
+                tts_start = asyncio.get_event_loop().time()
+                tts_wav = await sarvam.text_to_speech(response, selected_language)
+                tts_duration = asyncio.get_event_loop().time() - tts_start
+                logger.info(f"🎵 TTS generation time: {tts_duration:.2f}s")
+            else:
+                tts_duration = 0  # Already generated by orchestrator
             
             if tts_wav:
                 # Convert WAV to raw mulaw (8kHz, mono) for Twilio
@@ -435,7 +469,7 @@ Common queries you can help with:
                     
                     send_duration = asyncio.get_event_loop().time() - send_start
                     total_time = asyncio.get_event_loop().time() - stt_start
-                    logger.info(f"⏱️ Total response time: {total_time:.2f}s (STT: {stt_duration:.2f}s, LLM: {llm_duration:.2f}s, TTS: {tts_duration:.2f}s, Send: {send_duration:.2f}s)")
+                    logger.info(f"⏱️ Total response time: {total_time:.2f}s (STT: {stt_duration:.2f}s, LLM: included, TTS: {tts_duration:.2f}s, Send: {send_duration:.2f}s)")
                     
                     is_processing = False  # Unlock after response sent
                 else:
@@ -460,8 +494,53 @@ Common queries you can help with:
             
             if event_type == "start":
                 stream_sid = event["start"]["streamSid"]
+                call_sid = event["start"].get("callSid", "")
                 stream_ready = True
-                logger.info(f"🎙️ Stream started: {stream_sid}")
+                logger.info(f"🎙️ Stream started: {stream_sid}, CallSID: {call_sid}")
+                
+                # Retrieve language from stored map using call_sid
+                if call_sid and call_sid in call_language_map:
+                    selected_language = call_language_map[call_sid]
+                    selected_lang_name = language_names.get(selected_language, "Telugu")
+                    logger.info(f"🌐 Retrieved language from call_sid: {selected_lang_name} ({selected_language})")
+                    
+                    # Update orchestrator with correct language
+                    orchestrator.set_language(selected_language)
+                    system_prompt = f"""You are a helpful customer support agent for the Electrical Department in India.
+
+CRITICAL: User selected {selected_lang_name} language. You MUST respond ONLY in {selected_lang_name}.
+
+Your responsibilities:
+- Handle electrical complaints (power outages, voltage issues, meter problems)
+- Provide information about electricity bills and payments
+- Help with new connection requests
+- Report electrical hazards and emergencies
+- Provide lineman contact numbers and department information
+
+Guidelines:
+- Keep responses SHORT and CONCISE (2-3 sentences maximum for voice calls)
+- Be professional, polite, and helpful
+- Ask ONE clear question at a time
+- If you don't have specific information, acknowledge briefly and offer to connect to a human agent
+- For emergencies, prioritize safety and provide emergency contact: 1912
+
+Common queries you can help with:
+- Power outage complaints
+- High electricity bill queries
+- New connection applications
+- Meter reading issues
+- Lineman contact numbers
+- Payment methods
+- Emergency electrical issues
+
+Remember: ALWAYS respond in {selected_lang_name} language only!"""
+                    orchestrator.set_system_prompt(system_prompt)
+                    messages = orchestrator.get_context()
+                else:
+                    logger.warning(f"⚠️ No language found for call_sid {call_sid}, using default: Telugu (te-IN)")
+                    selected_language = "te-IN"
+                    selected_lang_name = "Telugu"
+                    orchestrator.set_language(selected_language)
             
             elif event_type == "media":
                 # Wait for stream to be ready before processing audio
@@ -519,6 +598,10 @@ Common queries you can help with:
             
             elif event_type == "stop":
                 logger.info("🛑 Stream stopped")
+                # Clean up language mapping for this call
+                if call_sid and call_sid in call_language_map:
+                    del call_language_map[call_sid]
+                    logger.debug(f"🧹 Cleaned up language mapping for call {call_sid}")
                 break
     
     except asyncio.TimeoutError:
@@ -527,13 +610,17 @@ Common queries you can help with:
         logger.error(f"❌ WebSocket error: {e}")
     
     finally:
+        # Clean up language mapping for this call (if not already cleaned)
+        if call_sid and call_sid in call_language_map:
+            del call_language_map[call_sid]
+            logger.debug(f"🧹 Cleaned up language mapping for call {call_sid}")
+        
         # Call analytics summary
         call_duration = asyncio.get_event_loop().time() - call_start_time
-        final_language = detected_language or "auto-detected"
         logger.info(f"""
 📊 Call Summary:
    - Duration: {call_duration:.1f}s
-   - Language: {final_language} ({language_names.get(final_language, 'unknown') if final_language != 'auto-detected' else 'not detected'})
+   - Language: {selected_language}
    - Queries handled: {query_count}
    - Failed STT attempts: {failed_stt_count}
    - Stream ID: {stream_sid}

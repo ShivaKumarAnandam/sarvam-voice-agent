@@ -1,146 +1,182 @@
 """
-Language Coordinator - Handles multilingual workflows and auto-switching
+Language Coordinator - Handles multilingual workflows
+Ensures language consistency across STT → LLM → TTS pipeline
+Supports automatic language switching based on detection
 """
 
-from typing import Optional, Dict, List
+from typing import Optional, List
 from loguru import logger
 
 
 class LanguageCoordinator:
-    """
-    Coordinates language across STT, LLM, and TTS modules.
-    Supports auto-switching based on detected language.
-    """
+    """Coordinates language across modules with automatic switching"""
     
-    # Supported languages
-    SUPPORTED_LANGUAGES = {
+    # Language name mapping
+    LANGUAGE_NAMES = {
         "te-IN": "Telugu",
         "hi-IN": "Hindi",
         "en-IN": "English",
         "gu-IN": "Gujarati"
     }
     
-    def __init__(
-        self,
-        default_language: str = "te-IN",
-        switch_threshold: int = 2,
-        min_turns_before_switch: int = 1,
-        history_size: int = 5
-    ):
+    def __init__(self, switch_threshold: int = 2, history_size: int = 5, min_turns_before_switch: int = 2):
         """
         Initialize language coordinator
         
         Args:
-            default_language: Default language code (default: "te-IN")
-            switch_threshold: Number of consecutive detections before auto-switch (default: 2)
-            min_turns_before_switch: Minimum turns before allowing switch (default: 1)
-            history_size: Size of language detection history (default: 5)
+            switch_threshold: Number of consecutive different language detections before auto-switching (default: 2)
+            history_size: Maximum number of recent language detections to remember (default: 5)
+            min_turns_before_switch: Minimum turns before allowing auto-switch (default: 2)
         """
-        self.selected_language: Optional[str] = default_language
-        self.detected_language: Optional[str] = None
-        self.default_language = default_language
-        self.switch_threshold = switch_threshold
-        self.min_turns_before_switch = min_turns_before_switch
-        self.history_size = history_size
+        self.selected_language: Optional[str] = None  # From IVR/user choice
+        self.detected_language: Optional[str] = None  # From STT
+        self.language_consistency: bool = True
         
-        # Tracking for auto-switch
-        self.language_history: List[str] = []
-        self.consecutive_different_count = 0
-        self.last_different_language: Optional[str] = None
-        self.turn_count = 0
-        self.switch_count = 0
+        # Automatic language switching
+        self.switch_threshold = switch_threshold
+        self.history_size = history_size
+        self.min_turns_before_switch = min_turns_before_switch
+        self.language_history: List[str] = []  # Track recent language detections
+        self.consecutive_different_count: int = 0  # Count consecutive different language detections
+        self.turn_count: int = 0  # Track number of conversation turns
+        self.last_different_language: Optional[str] = None  # Track which different language was detected
     
     def set_language(self, language_code: str):
         """
         Set selected language (from IVR/user choice)
         
         Args:
-            language_code: Language code to set
+            language_code: Language code (e.g., "te-IN")
         """
-        if language_code not in self.SUPPORTED_LANGUAGES:
-            logger.warning(f"⚠️ Unsupported language code: {language_code}, using default")
-            language_code = self.default_language
-        
-        if self.selected_language != language_code:
-            old_language = self.selected_language
+        if language_code in self.LANGUAGE_NAMES:
             self.selected_language = language_code
             logger.info(f"🌐 Language set to: {self.get_language_name(language_code)} ({language_code})")
-            # Reset tracking when manually setting language
-            self.consecutive_different_count = 0
-            self.last_different_language = None
+        else:
+            logger.warning(f"⚠️ Unknown language code: {language_code}, defaulting to Telugu")
+            self.selected_language = "te-IN"
     
     def set_detected_language(self, language_code: str):
         """
-        Set detected language from STT (may trigger auto-switch)
+        Set detected language (from STT) and check for auto-switch
         
         Args:
             language_code: Detected language code
         """
-        if language_code not in self.SUPPORTED_LANGUAGES:
-            logger.warning(f"⚠️ Unsupported detected language: {language_code}")
-            return
-        
         self.detected_language = language_code
         
-        # Track history (last N detections)
+        # Add to history
         self.language_history.append(language_code)
         if len(self.language_history) > self.history_size:
-            self.language_history.pop(0)
+            self.language_history.pop(0)  # Keep only recent history
         
-        # Increment turn count
-        self.turn_count += 1
-        
-        # Check if different from selected
+        # Check if detected language is different from selected
         if self.selected_language and language_code != self.selected_language:
-            # Same different language as before?
+            # Different language detected
             if self.last_different_language == language_code:
+                # Same different language as before - increment counter
                 self.consecutive_different_count += 1
+                logger.info(
+                    f"🔍 Language mismatch detected: {self.get_language_name(language_code)} "
+                    f"(selected: {self.get_language_name(self.selected_language)}). "
+                    f"Consecutive count: {self.consecutive_different_count}/{self.switch_threshold}"
+                )
             else:
-                # New different language - reset counter
+                # Different language from previous detection - reset counter
                 self.consecutive_different_count = 1
                 self.last_different_language = language_code
+                logger.info(
+                    f"🔍 Language mismatch detected: {self.get_language_name(language_code)} "
+                    f"(selected: {self.get_language_name(self.selected_language)}). "
+                    f"Starting count: 1/{self.switch_threshold}"
+                )
             
-            # Auto-switch after threshold
+            # Check if we should auto-switch
             if (self.consecutive_different_count >= self.switch_threshold and 
                 self.turn_count >= self.min_turns_before_switch):
+                # Auto-switch to detected language
                 old_language = self.selected_language
-                self.selected_language = language_code  # SWITCH!
-                self.consecutive_different_count = 0
-                self.switch_count += 1
-                logger.info(f"🔄 AUTO-SWITCHED: {self.get_language_name(old_language)} ({old_language}) → {self.get_language_name(language_code)} ({language_code})")
+                self.selected_language = language_code
+                self.consecutive_different_count = 0  # Reset counter
+                self.last_different_language = None
+                self.language_consistency = True
+                logger.info(
+                    f"🔄 AUTO-SWITCHED language: {self.get_language_name(old_language)} → "
+                    f"{self.get_language_name(language_code)} "
+                    f"(after {self.switch_threshold} consecutive detections)"
+                )
         else:
             # Languages match - reset counter
+            if self.consecutive_different_count > 0:
+                logger.debug(
+                    f"✅ Language match: {self.get_language_name(language_code)}. "
+                    f"Resetting consecutive counter."
+                )
             self.consecutive_different_count = 0
             self.last_different_language = None
-    
-    def ensure_consistency(self) -> str:
-        """
-        Get the language to use for processing (ensures consistency)
+            self.language_consistency = True
         
-        Returns:
-            Language code to use (selected > detected > default)
-        """
-        language = self.selected_language or self.detected_language or self.default_language
-        return language
+        logger.debug(f"🔍 Language detected: {self.get_language_name(language_code)} ({language_code})")
     
     def get_processing_language(self) -> str:
-        """Alias for ensure_consistency()"""
-        return self.ensure_consistency()
+        """
+        Get language to use for processing
+        Priority: selected > detected > default
+        
+        Returns:
+            Language code to use
+        """
+        language = self.selected_language or self.detected_language or "te-IN"
+        return language
     
     def get_language_name(self, language_code: Optional[str] = None) -> str:
         """
         Get human-readable language name
         
         Args:
-            language_code: Language code (if None, uses selected language)
+            language_code: Language code (uses processing language if None)
             
         Returns:
             Language name
         """
-        code = language_code or self.selected_language or self.default_language
-        return self.SUPPORTED_LANGUAGES.get(code, code)
+        if language_code is None:
+            language_code = self.get_processing_language()
+        return self.LANGUAGE_NAMES.get(language_code, "Telugu")
     
-    def get_switch_status(self) -> Dict[str, any]:
+    def ensure_consistency(self) -> str:
+        """
+        Ensure language consistency across pipeline
+        Note: Auto-switching is now handled in set_detected_language()
+        
+        Returns:
+            Language code to use for all modules
+        """
+        target_language = self.get_processing_language()
+        
+        # Increment turn count for auto-switch logic
+        self.turn_count += 1
+        
+        # Check consistency (for logging)
+        if self.selected_language and self.detected_language:
+            if self.selected_language != self.detected_language:
+                # This is expected during language switching - don't log as warning
+                self.language_consistency = False
+            else:
+                self.language_consistency = True
+        
+        return target_language
+    
+    def reset(self):
+        """Reset language coordinator"""
+        self.selected_language = None
+        self.detected_language = None
+        self.language_consistency = True
+        self.language_history = []
+        self.consecutive_different_count = 0
+        self.turn_count = 0
+        self.last_different_language = None
+        logger.debug("🔄 Language coordinator reset")
+    
+    def get_switch_status(self) -> dict:
         """
         Get current language switching status
         
@@ -150,23 +186,14 @@ class LanguageCoordinator:
         return {
             "selected_language": self.selected_language,
             "detected_language": self.detected_language,
-            "processing_language": self.ensure_consistency(),
             "consecutive_different_count": self.consecutive_different_count,
             "switch_threshold": self.switch_threshold,
+            "turn_count": self.turn_count,
+            "min_turns_before_switch": self.min_turns_before_switch,
             "can_switch": (
                 self.consecutive_different_count >= self.switch_threshold and
                 self.turn_count >= self.min_turns_before_switch
             ),
-            "turn_count": self.turn_count,
-            "switch_count": self.switch_count,
             "recent_history": self.language_history[-3:] if len(self.language_history) >= 3 else self.language_history
         }
-    
-    def reset(self):
-        """Reset language coordinator state"""
-        self.detected_language = None
-        self.language_history.clear()
-        self.consecutive_different_count = 0
-        self.last_different_language = None
-        self.turn_count = 0
-        logger.debug("🔄 Language coordinator reset")
+
